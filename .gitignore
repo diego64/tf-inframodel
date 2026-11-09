@@ -1,0 +1,35 @@
+# Terraform — ref.: https://github.com/github/gitignore/blob/main/Terraform.gitignore
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+*.tfplan
+tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Variáveis: terraform.tfvars de cada stack É versionado (somente valores não sensíveis).
+# Overrides pessoais ficam em *.local.tfvars / *.auto.tfvars (ignorados).
+*.local.tfvars
+*.auto.tfvars
+*.auto.tfvars.json
+backend.hcl
+
+# Ambiente
+.env
+.env.*
+!.env.example
+
+# SO / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+#
+.claude

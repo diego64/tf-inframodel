@@ -1,0 +1,134 @@
+# ---------- FAF_DNS: BIND9 (zona ${dns_zone}) ----------
+# DNS_01 = primário (zona master, gerada pelo Terraform)
+# DNS_02..N = secundários (zona slave via AXFR/NOTIFY)
+# ${ad_realm} é encaminhada para os DCs do FAF_AD.
+
+DNS_PRIMARY_IP="${dns_ips[0]}"
+ZONE="${dns_zone}"
+
+apt_install bind9 bind9-utils bind9-dnsutils
+
+# systemd-resolved ocupa 127.0.0.53:53 — libera a porta para o named
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/faf-no-stub.conf <<'EOF'
+[Resolve]
+DNSStubListener=no
+EOF
+systemctl restart systemd-resolved
+
+cat > /etc/bind/named.conf.options <<EOF
+// Gerado pelo bootstrap FAF_DNS
+acl "faf_vpc" { $FAF_VPC_CIDR; 127.0.0.1; };
+
+options {
+    directory "/var/cache/bind";
+    listen-on { any; };
+    listen-on-v6 { none; };
+
+    recursion yes;
+    allow-recursion { faf_vpc; };
+    allow-query { faf_vpc; };
+    allow-transfer { none; };
+
+    forwarders { $FAF_VPC_DNS; };
+    forward first;
+
+    // .internal não possui cadeia DNSSEC pública; validação quebraria a zona AD encaminhada
+    dnssec-validation no;
+
+    version "not disclosed";
+    minimal-responses yes;
+};
+
+logging {
+    channel faf_log { file "/var/log/named/faf.log" versions 3 size 10m; severity info; print-time yes; };
+    category default { faf_log; };
+    category queries { faf_log; };
+};
+EOF
+mkdir -p /var/log/named && chown bind:bind /var/log/named
+
+if [ "$FAF_INDEX" = "1" ]; then
+  cat > /etc/bind/named.conf.local <<EOF
+// Gerado pelo bootstrap FAF_DNS (primário)
+zone "$ZONE" {
+    type primary;
+    file "/etc/bind/db.$ZONE";
+%{ if length(dns_ips) > 1 ~}
+    allow-transfer { ${join("; ", slice(dns_ips, 1, length(dns_ips)))}; };
+    also-notify { ${join("; ", slice(dns_ips, 1, length(dns_ips)))}; };
+    notify yes;
+%{ else ~}
+    allow-transfer { none; };
+    notify no;
+%{ endif ~}
+};
+
+zone "${ad_realm}" {
+    type forward;
+    forward only;
+    forwarders { ${join("; ", ad_ips)}; };
+};
+EOF
+
+  cat > "/etc/bind/db.$ZONE" <<'EOF'
+; Zona ${dns_zone} — gerada pelo Terraform (serial determinístico)
+$TTL 300
+@   IN SOA ${hostname}.${dns_zone}. hostmaster.${dns_zone}. (
+        ${dns_serial} ; serial
+        3600       ; refresh
+        600        ; retry
+        604800     ; expire
+        300 )      ; negative TTL
+%{ for ip_index, ip in dns_ips ~}
+@   IN NS  ${project}-dns-${format("%02d", ip_index + 1)}.${dns_zone}.
+%{ endfor ~}
+
+; ---- Hosts (FAF_*) ----
+%{ for r in dns_records ~}
+${r.host}    IN A    ${r.ip}
+%{ endfor ~}
+
+; ---- Aliases por serviço ----
+gateway     IN CNAME ${project}-gateway-01
+firewall    IN CNAME ${project}-firewall-01
+ad          IN CNAME ${project}-ad-01
+EOF
+  named-checkzone "$ZONE" "/etc/bind/db.$ZONE"
+else
+  cat > /etc/bind/named.conf.local <<EOF
+// Gerado pelo bootstrap FAF_DNS (secundário)
+zone "$ZONE" {
+    type secondary;
+    file "/var/cache/bind/db.$ZONE";
+    primaries { $DNS_PRIMARY_IP; };
+};
+
+zone "${ad_realm}" {
+    type forward;
+    forward only;
+    forwarders { ${join("; ", ad_ips)}; };
+};
+EOF
+fi
+
+has_answer() { dig +short @127.0.0.1 "$2" "$1" | grep -q .; }
+
+named-checkconf
+systemctl enable named
+systemctl restart named
+
+# Servidor DNS usa a si mesmo como resolver
+rm -f /etc/resolv.conf
+printf 'search %s\nnameserver 127.0.0.1\nnameserver %s\n' "$ZONE" "$FAF_VPC_DNS" > /etc/resolv.conf
+
+if [ "$FAF_INDEX" != "1" ]; then
+  log "aguardando transferência da zona a partir de $DNS_PRIMARY_IP"
+  wait_for_port "$DNS_PRIMARY_IP" 53 60
+  retry 30 10 has_answer SOA "$ZONE"
+fi
+
+retry 12 5 has_answer A "$FAF_HOSTNAME.$ZONE"
+
+touch /var/lib/faf/bootstrap.done
+log "FAF_DNS pronto ($([ "$FAF_INDEX" = "1" ] && echo primário || echo secundário))"

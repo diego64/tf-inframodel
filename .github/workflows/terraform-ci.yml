@@ -1,0 +1,98 @@
+# =============================================================================
+# CI: qualidade e segurança do Terraform (não aplica nada na AWS)
+# fmt -> validate (matriz por stack) -> bash -n dos templates -> tflint -> checkov
+# Recomendado: fixar as actions por SHA (o Dependabot abre PRs de atualização).
+# =============================================================================
+name: terraform-ci
+
+on:
+  pull_request:
+    paths: ["**/*.tf", "**/*.tfvars", "**/templates/**", ".tflint.hcl", ".github/workflows/terraform-ci.yml"]
+  push:
+    branches: [main]
+    paths: ["**/*.tf", "**/*.tfvars", "**/templates/**", ".tflint.hcl", ".github/workflows/terraform-ci.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: terraform fmt -recursive -check -diff
+
+  validate:
+    name: validate (${{ matrix.stack }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        stack:
+          - 00-remote-state-stack
+          - 01-network-stack
+          - 02-security-stack
+          - 03-compute-stack
+    defaults:
+      run:
+        working-directory: ${{ matrix.stack }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - run: terraform init -backend=false
+      - run: terraform validate
+
+  templates:
+    name: bash -n (templates)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Checar sintaxe bash (interpolações substituídas)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tpl"
+          for f in 03-compute-stack/templates/*.tftpl; do
+            sed -E 's/\$\{[^}]*\}/X/g; s/%\{[^}]*\}//g' "$f" > "$RUNNER_TEMP/tpl/$(basename "$f" .tftpl)"
+          done
+          for f in "$RUNNER_TEMP"/tpl/*.sh; do bash -n "$f" && echo "ok  $f"; done
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: terraform-linters/setup-tflint@v5
+      - run: |
+          tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  checkov:
+    name: checkov
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install --quiet checkov
+          checkov -d . --framework terraform --compact --quiet \
+            --skip-check CKV_AWS_126,CKV2_AWS_11,CKV_AWS_144,CKV_AWS_145,CKV_AWS_18,CKV2_AWS_62,CKV_AWS_337,CKV_AWS_88,CKV_AWS_382,CKV_AWS_158,CKV_AWS_338,CKV2_AWS_5

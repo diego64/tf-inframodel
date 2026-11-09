@@ -1,0 +1,55 @@
+# ---------- FAF_GATEWAY: NAT instance (saída das subnets privadas) ----------
+# Fluxo: subnet core/app -> rota 0.0.0.0/0 -> ENI do FAF_GATEWAY -> masquerade -> IGW
+
+cat > /etc/sysctl.d/99-faf-nat.conf <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_redirects = 0
+EOF
+sysctl --system >/dev/null
+
+WAN_IF="$(ip -4 route show default | awk '{print $5; exit}')"
+log "interface WAN detectada: $WAN_IF"
+
+cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+# Gerado pelo bootstrap FAF_GATEWAY — não editar manualmente
+flush ruleset
+
+table inet filter {
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    ip saddr $FAF_VPC_CIDR accept
+    icmp type { echo-request, destination-unreachable, time-exceeded } accept
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    ip saddr $FAF_VPC_CIDR oifname "$WAN_IF" accept
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+  }
+}
+
+table ip nat {
+  chain postrouting {
+    type nat hook postrouting priority srcnat; policy accept;
+    ip saddr $FAF_VPC_CIDR oifname "$WAN_IF" masquerade
+  }
+}
+EOF
+
+nft -c -f /etc/nftables.conf
+systemctl enable --now nftables
+systemctl restart nftables
+
+log "NAT ativo: $(nft list table ip nat | grep -c masquerade) regra(s) de masquerade"
+touch /var/lib/faf/bootstrap.done
+log "FAF_GATEWAY pronto"

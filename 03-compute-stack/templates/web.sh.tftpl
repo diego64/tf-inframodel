@@ -1,0 +1,61 @@
+# ---------- FAF_WEB: site estático (Nginx) ----------
+# Recebe tráfego somente do FAF_FIREWALL (porta 80, SG por referência).
+
+apt_install nginx
+
+rm -f /etc/nginx/sites-enabled/default
+mkdir -p /var/www/faf
+
+cat > /var/www/faf/index.html <<EOF
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>$FAF_NAME</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; background: #0f172a; color: #e2e8f0; }
+    main { padding: 2rem 2.5rem; border: 1px solid #334155; border-radius: 12px; background: #111827; }
+    h1 { margin: 0 0 .5rem; font-size: 1.6rem; }
+    dt { color: #94a3b8; font-size: .8rem; text-transform: uppercase; margin-top: .8rem; }
+    dd { margin: 0; font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>$FAF_NAME</h1>
+    <dl>
+      <dt>Serviço</dt><dd>Site estático (Nginx)</dd>
+      <dt>Hostname</dt><dd>$FAF_FQDN</dd>
+      <dt>IP privado</dt><dd>$FAF_PRIVATE_IP</dd>
+      <dt>Provisionado por</dt><dd>Terraform + cloud-init</dd>
+    </dl>
+  </main>
+</body>
+</html>
+EOF
+
+cat > /etc/nginx/conf.d/faf-web.conf <<'EOF'
+server_tokens off;
+
+server {
+    listen 80 default_server;
+    server_name _;
+    root /var/www/faf;
+    index index.html;
+
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+
+    location = /healthz { access_log off; return 200 "ok\n"; }
+    location / { try_files $uri $uri/ =404; }
+}
+EOF
+
+nginx -t
+systemctl enable nginx
+systemctl reload nginx || systemctl restart nginx
+
+touch /var/lib/faf/bootstrap.done
+log "FAF_WEB pronto"

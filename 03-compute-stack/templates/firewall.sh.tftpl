@@ -1,0 +1,111 @@
+# ---------- FAF_FIREWALL: borda (nftables default-drop + proxy reverso) ----------
+# Único ponto de entrada público:
+#   :80   -> pool FAF_WEB  (round-robin)
+#   :8080 -> pool FAF_LAMP (ip_hash: sessão "grudada" no mesmo nó, ver ADR 0004)
+
+apt_install nginx
+
+cat > /etc/sysctl.d/99-faf-hardening.conf <<'EOF'
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+sysctl --system >/dev/null
+
+cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+# Gerado pelo bootstrap FAF_FIREWALL — não editar manualmente
+flush ruleset
+
+table inet filter {
+  set public_services {
+    type inet_service
+    elements = { 80, 8080 }
+  }
+
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ct state invalid drop
+    tcp dport @public_services ct state new limit rate over 200/second burst 400 packets drop
+    tcp dport @public_services accept
+    ip saddr $FAF_VPC_CIDR accept
+    icmp type { echo-request, destination-unreachable, time-exceeded } limit rate 10/second accept
+    limit rate 5/second log prefix "[faf-fw-drop] " level info
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+  }
+}
+EOF
+nft -c -f /etc/nftables.conf
+systemctl enable --now nftables
+systemctl restart nftables
+
+rm -f /etc/nginx/sites-enabled/default
+cat > /etc/nginx/conf.d/faf-edge.conf <<'EOF'
+# Gerado pelo bootstrap FAF_FIREWALL
+server_tokens off;
+limit_req_zone $binary_remote_addr zone=faf_req:10m rate=20r/s;
+
+upstream faf_web {
+%{ for ip in web_ips ~}
+    server ${ip}:80 max_fails=3 fail_timeout=10s;
+%{ endfor ~}
+    keepalive 16;
+}
+
+upstream faf_lamp {
+    ip_hash;
+%{ for ip in lamp_ips ~}
+    server ${ip}:80 max_fails=3 fail_timeout=10s;
+%{ endfor ~}
+}
+
+server {
+    listen 80 default_server;
+    server_name _;
+
+    location = /healthz { access_log off; return 200 "ok\n"; }
+
+    location / {
+        limit_req zone=faf_req burst=40 nodelay;
+        proxy_pass http://faf_web;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        add_header X-FAF-Backend $upstream_addr always;
+    }
+}
+
+server {
+    listen 8080;
+    server_name _;
+
+    location / {
+        limit_req zone=faf_req burst=40 nodelay;
+        proxy_pass http://faf_lamp;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        add_header X-FAF-Backend $upstream_addr always;
+    }
+}
+EOF
+
+nginx -t
+systemctl enable nginx
+systemctl reload nginx || systemctl restart nginx
+
+touch /var/lib/faf/bootstrap.done
+log "FAF_FIREWALL pronto: :80 -> ${length(web_ips)} nó(s) WEB | :8080 -> ${length(lamp_ips)} nó(s) LAMP"

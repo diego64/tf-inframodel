@@ -1,0 +1,14 @@
+# -----------------------------------------------------------------------------
+# 01-network-stack — versões de Terraform e providers
+# -----------------------------------------------------------------------------
+terraform {
+  # >= 1.10: lock nativo do backend S3 (use_lockfile), sem DynamoDB
+  required_version = ">= 1.10.0, < 2.0.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.0"
+    }
+  }
+}

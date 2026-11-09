@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# =============================================================================
+# FAF bootstrap — bloco comum (renderizado por templatefile())
+# Máquina : ${name}   Serviço: ${upper(service)}   Hostname: ${hostname}
+# Log     : /var/log/faf-bootstrap.log    Marcador: /var/lib/faf/bootstrap.done
+# Atenção : "$$" seguido de "{" é o escape do Terraform para expansão bash com chaves.
+# =============================================================================
+set -Eeuo pipefail
+exec > >(tee -a /var/log/faf-bootstrap.log) 2>&1
+trap 'echo "[faf] ERRO na linha $LINENO (exit $?)"; exit 1' ERR
+
+log() { echo "[faf] $(date -Is) $*"; }
+
+FAF_NAME="${name}"
+FAF_SERVICE="${service}"
+FAF_INDEX="${index}"
+FAF_HOSTNAME="${hostname}"
+FAF_FQDN="${hostname}.${dns_zone}"
+FAF_PRIVATE_IP="${private_ip}"
+FAF_REGION="${region}"
+FAF_VPC_CIDR="${vpc_cidr}"
+FAF_VPC_DNS="${vpc_dns_resolver}"
+export DEBIAN_FRONTEND=noninteractive
+
+mkdir -p /var/lib/faf /etc/faf
+if [ -f /var/lib/faf/bootstrap.done ]; then
+  log "bootstrap já executado anteriormente — nada a fazer"
+  exit 0
+fi
+
+log "início do bootstrap de $FAF_NAME ($FAF_SERVICE #$FAF_INDEX)"
+
+# ---------- Hostname (RFC 1123: sem underscore) ----------
+hostnamectl set-hostname "$FAF_HOSTNAME"
+sed -i "/[[:space:]]$FAF_HOSTNAME\$/d" /etc/hosts
+echo "$FAF_PRIVATE_IP $FAF_FQDN $FAF_HOSTNAME" >> /etc/hosts
+
+# ---------- Utilitários ----------
+retry() {
+  # retry <tentativas> <intervalo_s> <comando...>
+  local attempts="$1" delay="$2" n=1
+  shift 2
+  until "$@"; do
+    if [ "$n" -ge "$attempts" ]; then
+      log "falhou após $attempts tentativas: $*"
+      return 1
+    fi
+    log "tentativa $n/$attempts falhou, aguardando $delay s: $*"
+    n=$((n + 1))
+    sleep "$delay"
+  done
+}
+
+wait_for_egress() {
+  # Instâncias privadas dependem do FAF_GATEWAY (NAT) estar pronto
+  retry 60 10 curl -fsS --max-time 5 -o /dev/null "http://$FAF_REGION.ec2.archive.ubuntu.com/ubuntu/"
+}
+
+wait_for_port() {
+  # wait_for_port <host> <porta> [tentativas]
+  local host="$1" port="$2" attempts="$${3:-90}"
+  retry "$attempts" 10 timeout 3 bash -c "</dev/tcp/$host/$port"
+}
+
+apt_install() {
+  retry 5 15 apt-get update -y
+  retry 5 15 apt-get install -y --no-install-recommends "$@"
+}
+
+get_secret() {
+  # get_secret <nome-do-parametro-ssm>
+  aws ssm get-parameter --region "$FAF_REGION" --name "$1" \
+    --with-decryption --query 'Parameter.Value' --output text
+}
+
+# ---------- Base comum a todas as máquinas ----------
+wait_for_egress
+apt_install ca-certificates curl unzip jq nftables chrony unattended-upgrades
+
+# AWS CLI v2 (snap oficial) — usada para ler segredos do SSM Parameter Store
+if ! command -v aws >/dev/null 2>&1; then
+  retry 5 15 snap install aws-cli --classic
+  export PATH="$PATH:/snap/bin"
+fi
+
+# Amazon Time Sync Service (link-local) — essencial para Kerberos no AD
+cat > /etc/chrony/sources.d/faf-aws.sources <<'EOF'
+server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4
+EOF
+systemctl restart chrony
+
+# Atualizações de segurança automáticas
+cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+log "bloco comum concluído"
+
+# =============================================================================
+# Bloco específico do serviço ${upper(service)}
+# =============================================================================

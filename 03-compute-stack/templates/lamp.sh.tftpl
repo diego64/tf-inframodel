@@ -1,0 +1,140 @@
+# ---------- FAF_LAMP: Apache + PHP + MySQL (no mesmo host) ----------
+# MySQL escuta apenas em 127.0.0.1. root usa auth_socket (sem senha);
+# a aplicação usa um usuário dedicado com senha lida do SSM.
+
+apt_install apache2 libapache2-mod-php php php-mysql mysql-server
+
+log "lendo senha do banco no SSM"
+DB_NAME="faf_app"
+DB_USER="faf_app"
+DB_PASS="$(get_secret '${ssm_lamp_db}')"
+
+# ---------- MySQL ----------
+cat > /etc/mysql/mysql.conf.d/99-faf.cnf <<'EOF'
+[mysqld]
+bind-address        = 127.0.0.1
+mysqlx-bind-address = 127.0.0.1
+local_infile        = 0
+EOF
+systemctl enable mysql
+systemctl restart mysql
+
+mysql --protocol=socket -uroot <<SQL
+CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+ALTER USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+GRANT SELECT, INSERT ON $DB_NAME.* TO '$DB_USER'@'localhost';
+DELETE FROM mysql.user WHERE User = '';
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+
+CREATE TABLE IF NOT EXISTS $DB_NAME.visits (
+  id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  node       VARCHAR(64)  NOT NULL,
+  client_ip  VARCHAR(45)  NOT NULL,
+  created_at TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+SQL
+
+# Credenciais da aplicação: legíveis apenas por root e www-data
+cat > /etc/faf/app.ini <<EOF
+db_host = "127.0.0.1"
+db_name = "$DB_NAME"
+db_user = "$DB_USER"
+db_pass = "$DB_PASS"
+node    = "$FAF_NAME"
+EOF
+chown root:www-data /etc/faf/app.ini
+chmod 0640 /etc/faf/app.ini
+unset DB_PASS
+
+# ---------- Aplicação PHP ----------
+rm -f /var/www/html/index.html
+cat > /var/www/html/index.php <<'PHP'
+<?php
+declare(strict_types=1);
+
+$cfg = parse_ini_file('/etc/faf/app.ini');
+header('Content-Type: text/html; charset=utf-8');
+
+try {
+    $pdo = new PDO(
+        sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', $cfg['db_host'], $cfg['db_name']),
+        $cfg['db_user'],
+        $cfg['db_pass'],
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
+    );
+
+    $client = $_SERVER['HTTP_X_REAL_IP'] ?? $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $pdo->prepare('INSERT INTO visits (node, client_ip) VALUES (?, ?)')->execute([$cfg['node'], $client]);
+
+    $total = (int) $pdo->query('SELECT COUNT(*) FROM visits')->fetchColumn();
+    $last  = $pdo->query('SELECT client_ip, created_at FROM visits ORDER BY id DESC LIMIT 5')->fetchAll(PDO::FETCH_ASSOC);
+    $mysql = $pdo->query('SELECT VERSION()')->fetchColumn();
+} catch (Throwable $e) {
+    http_response_code(500);
+    error_log('[faf-lamp] ' . $e->getMessage());
+    exit('Erro ao acessar o banco de dados.');
+}
+
+$e = static fn(string $v): string => htmlspecialchars($v, ENT_QUOTES, 'UTF-8');
+?>
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><?= $e($cfg['node']) ?></title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; display: grid; place-items: center; min-height: 100vh; background: #1e1b4b; color: #e0e7ff; }
+    main { padding: 2rem 2.5rem; border: 1px solid #4338ca; border-radius: 12px; background: #172554; min-width: 320px; }
+    h1 { margin: 0 0 1rem; font-size: 1.6rem; }
+    td, th { padding: .25rem .75rem; text-align: left; font-family: ui-monospace, monospace; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1><?= $e($cfg['node']) ?></h1>
+    <p>PHP <?= $e(PHP_VERSION) ?> · MySQL <?= $e((string) $mysql) ?></p>
+    <p>Visitas registradas neste nó: <strong><?= $total ?></strong></p>
+    <table>
+      <tr><th>Cliente</th><th>Data</th></tr>
+      <?php foreach ($last as $row): ?>
+        <tr><td><?= $e($row['client_ip']) ?></td><td><?= $e($row['created_at']) ?></td></tr>
+      <?php endforeach; ?>
+    </table>
+  </main>
+</body>
+</html>
+PHP
+
+cat > /var/www/html/healthz.php <<'PHP'
+<?php
+http_response_code(200);
+echo "ok\n";
+PHP
+
+# ---------- Apache hardening ----------
+cat > /etc/apache2/conf-available/faf-security.conf <<'EOF'
+ServerTokens Prod
+ServerSignature Off
+TraceEnable Off
+Header always set X-Content-Type-Options "nosniff"
+Header always set X-Frame-Options "DENY"
+<Directory /var/www/html>
+    Options -Indexes
+    AllowOverride None
+    DirectoryIndex index.php
+</Directory>
+EOF
+sed -i 's/^expose_php = On/expose_php = Off/' /etc/php/*/apache2/php.ini
+a2enmod headers >/dev/null
+a2enconf faf-security >/dev/null
+apache2ctl configtest
+systemctl enable apache2
+systemctl restart apache2
+
+retry 12 5 curl -fsS -o /dev/null http://127.0.0.1/
+
+touch /var/lib/faf/bootstrap.done
+log "FAF_LAMP pronto"

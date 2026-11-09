@@ -1,0 +1,91 @@
+# ---------- FAF_AD: Samba 4 Active Directory Domain Controller ----------
+# AD_01 provisiona o domínio; AD_02..N entram como DC adicional (replicação).
+# Ref.: https://wiki.samba.org/index.php/Setting_up_Samba_as_an_Active_Directory_Domain_Controller
+
+AD_REALM_UPPER="${upper(ad_realm)}"
+AD_REALM_LOWER="${lower(ad_realm)}"
+AD_NETBIOS="${ad_netbios}"
+AD_PRIMARY_IP="${ad_ips[0]}"
+AD_FQDN="$FAF_HOSTNAME.$AD_REALM_LOWER"
+
+# O FQDN de um DC precisa estar dentro do domínio AD
+sed -i "/[[:space:]]$FAF_HOSTNAME\$/d" /etc/hosts
+echo "$FAF_PRIVATE_IP $AD_FQDN $FAF_HOSTNAME" >> /etc/hosts
+
+log "lendo senha do Administrator no SSM"
+AD_ADMIN_PASS="$(get_secret '${ssm_ad_admin}')"
+
+# Pré-respostas do pacote krb5-config (instalação não interativa)
+debconf-set-selections <<EOF
+krb5-config krb5-config/default_realm string $AD_REALM_UPPER
+krb5-config krb5-config/kerberos_servers string $AD_FQDN
+krb5-config krb5-config/admin_server string $AD_FQDN
+krb5-config krb5-config/add_servers_realm string $AD_REALM_UPPER
+EOF
+
+apt_install samba smbclient winbind krb5-user krb5-config \
+  libpam-winbind libnss-winbind ldb-tools dnsutils acl attr
+
+# Samba AD DC substitui smbd/nmbd/winbind e assume a porta 53 (DNS interno)
+systemctl disable --now smbd nmbd winbind || true
+systemctl disable --now systemd-resolved || true
+systemctl unmask samba-ad-dc
+mv -f /etc/samba/smb.conf /etc/samba/smb.conf.orig 2>/dev/null || true
+mv -f /etc/krb5.conf /etc/krb5.conf.orig 2>/dev/null || true
+
+write_resolv() {
+  rm -f /etc/resolv.conf
+  {
+    echo "search $AD_REALM_LOWER ${dns_zone}"
+    for ns in "$@"; do echo "nameserver $ns"; done
+  } > /etc/resolv.conf
+}
+
+if [ "$FAF_INDEX" = "1" ]; then
+  # ------------------------- DC primário -------------------------
+  log "provisionando domínio $AD_REALM_UPPER ($AD_NETBIOS)"
+  write_resolv 127.0.0.1 "$FAF_VPC_DNS"
+
+  samba-tool domain provision \
+    --use-rfc2307 \
+    --realm="$AD_REALM_UPPER" \
+    --domain="$AD_NETBIOS" \
+    --server-role=dc \
+    --dns-backend=SAMBA_INTERNAL \
+    --host-name="$FAF_HOSTNAME" \
+    --host-ip="$FAF_PRIVATE_IP" \
+    --adminpass="$AD_ADMIN_PASS" \
+    --option="dns forwarder = $FAF_VPC_DNS"
+else
+  # ------------------------- DC adicional ------------------------
+  log "aguardando DC primário $AD_PRIMARY_IP (LDAP/389)"
+  write_resolv "$AD_PRIMARY_IP" "$FAF_VPC_DNS"
+  wait_for_port "$AD_PRIMARY_IP" 389 120
+  sleep 30 # margem para o DNS interno do DC primário registrar os SRV
+
+  join_dc() {
+    rm -f /etc/samba/smb.conf
+    samba-tool domain join "$AD_REALM_LOWER" DC \
+      --username="Administrator" \
+      --password="$AD_ADMIN_PASS" \
+      --dns-backend=SAMBA_INTERNAL \
+      --option="dns forwarder = $FAF_VPC_DNS" \
+      --option="idmap_ldb:use rfc2307 = yes"
+  }
+  retry 10 30 join_dc
+  write_resolv 127.0.0.1 "$AD_PRIMARY_IP"
+fi
+
+unset AD_ADMIN_PASS
+
+cp -f /var/lib/samba/private/krb5.conf /etc/krb5.conf
+systemctl enable --now samba-ad-dc
+
+# ---------- Verificações ----------
+retry 12 5 host -t SRV "_ldap._tcp.$AD_REALM_LOWER" 127.0.0.1
+retry 12 5 host -t A "$AD_FQDN" 127.0.0.1
+samba-tool domain level show || true
+log "DCs registrados: $(host -t SRV "_ldap._tcp.$AD_REALM_LOWER" 127.0.0.1 | wc -l)"
+
+touch /var/lib/faf/bootstrap.done
+log "FAF_AD pronto: $AD_FQDN"

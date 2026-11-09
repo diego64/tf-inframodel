@@ -78,7 +78,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: terraform-linters/setup-tflint@v5
+      - uses: terraform-linters/setup-tflint@v6
       - run: |
           tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
           tflint --recursive --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
